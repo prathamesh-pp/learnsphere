@@ -1,0 +1,23 @@
+import { Link, useParams } from "react-router-dom";
+import { useDiscoverCoursesQuery, useEnrollMutation, usePublishedCourseQuery } from "../../services/api";
+import { message } from "../../App";
+
+export function CourseDiscoveryPage() {
+  const { data, isLoading, isError } = useDiscoverCoursesQuery({ limit: 24 });
+  return <main className="page-wrap">
+    <section className="hero"><div><div className="eyebrow">LEARN SOMETHING THAT MOVES YOU FORWARD</div><h1>Knowledge for your next step.</h1><p>Explore courses from your learning organizations and build skills lesson by lesson.</p></div><div className="hero-art"><span>✦</span><span>Learn at your pace</span></div></section>
+    <div className="section-heading"><div><div className="eyebrow">COURSE CATALOG</div><h2>Find your next course</h2></div><span className="muted">{data?.data.items.length ?? 0} courses</span></div>
+    {isLoading ? <div className="center-state"><span className="spinner" />Loading courses…</div> : isError ? <div className="notice error">Courses could not be loaded. Try refreshing the page.</div> : data?.data.items.length ? <div className="course-grid">{data.data.items.map((course) => <Link className="course-card" to={`/courses/${course.id}`} key={course.id}>
+      <div className="course-art"><span>{course.category.slice(0, 1).toUpperCase()}</span><small>{course.difficulty}</small></div><div className="course-card-body"><div className="eyebrow">{course.category} · {course.language.toUpperCase()}</div><h3>{course.title}</h3><p>{course.shortDescription}</p><div className="card-meta"><span>{course.organizationName ?? "LearnSphere"}</span><span>{course.estimatedDurationMinutes} min</span></div></div>
+    </Link>)}</div> : <div className="empty-state"><span className="empty-icon">✦</span><h3>Your catalog is ready to grow</h3><p>Published courses from your organization will appear here.</p><Link className="button secondary" to="/teach">Open teaching space</Link></div>}
+  </main>;
+}
+
+export function CourseDetailPage() {
+  const { courseId = "" } = useParams(); const query = usePublishedCourseQuery(courseId, { skip: !courseId }); const [enroll, result] = useEnrollMutation();
+  const course = query.data?.data.course;
+  if (query.isLoading) return <div className="center-state"><span className="spinner" />Loading course…</div>;
+  if (!course) return <main className="page-wrap"><div className="notice error">{query.isError ? message(query.error) : "This course is unavailable."}</div><Link to="/courses">Back to courses</Link></main>;
+  const join = async () => { try { await enroll(course.id).unwrap(); } catch { /* Mutation state below provides feedback. */ } };
+  return <main className="page-wrap"><Link className="back-link" to="/courses">← Course catalog</Link><section className="detail-hero"><div><div className="eyebrow">{course.category} · {course.difficulty}</div><h1>{course.title}</h1><p>{course.shortDescription}</p><div className="detail-facts"><span>◷ {course.estimatedDurationMinutes} min</span><span>◎ {course.organizationName ?? "LearnSphere"}</span><span>⌑ {course.language.toUpperCase()}</span></div></div><div className="detail-action">{query.data?.data.enrollment ? <Link to="/learn" className="button primary">Continue learning</Link> : <button className="button primary" disabled={result.isLoading} onClick={() => void join()}>{result.isLoading ? "Enrolling…" : "Enroll for free"}</button>}{result.isError && <small className="inline-error">{message(result.error)}</small>}</div></section><div className="content-columns"><section className="prose-panel"><div className="eyebrow">ABOUT THIS COURSE</div><h2>What you’ll learn</h2><p className="long-copy">{course.description}</p>{course.learningObjectives.length > 0 && <ul className="objective-list">{course.learningObjectives.map((item) => <li key={item}>{item}</li>)}</ul>}{course.prerequisites.length > 0 && <><h3>Before you begin</h3><ul>{course.prerequisites.map((item) => <li key={item}>{item}</li>)}</ul></>}</section><aside className="lesson-outline"><div className="eyebrow">COURSE CONTENT</div><h3>{query.data?.data.lessons.length ?? 0} lessons</h3>{query.data?.data.lessons.map((lesson, index) => <div className="outline-row" key={lesson.id}><span className="lesson-number">{String(index + 1).padStart(2, "0")}</span><span><b>{lesson.title}</b><small>{lesson.estimatedDurationMinutes} min</small></span><span className="lock-mark">⌑</span></div>)}<p className="muted small">Enroll to access lesson content and track your progress.</p></aside></div></main>;
+}

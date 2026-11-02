@@ -1,0 +1,25 @@
+{
+  "name": "lms-platform",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/shared"
+  ],
+  "scripts": {
+    "dev": "concurrently -n web,api -c cyan,green \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "npm run dev --workspace @lms/web",
+    "dev:api": "npm run dev --workspace @lms/api",
+    "build": "npm run build --workspace @lms/shared && npm run build --workspace @lms/web && npm run build --workspace @lms/api",
+    "typecheck": "npm run typecheck --workspace @lms/shared && npm run typecheck --workspace @lms/api && npm run typecheck --workspace @lms/web",
+    "test": "npm run test --workspace @lms/api",
+    "test:integration": "npm run test:integration --workspace @lms/api"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "allowScripts": {
+    "argon2@0.45.1": true
+  }
+}
