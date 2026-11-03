@@ -14,6 +14,7 @@ import { CourseModel } from "../../src/models/course.model.js";
 import { LessonModel } from "../../src/models/lesson.model.js";
 import { EnrollmentModel } from "../../src/models/enrollment.model.js";
 import { LessonProgressModel } from "../../src/models/lesson-progress.model.js";
+import { MediaAssetModel, MediaUploadIntentModel } from "../../src/models/media-asset.model.js";
 import { isDatabaseReady, isTransactionCapableHello, REQUIRED_INDEXES, hasRequiredIndexes } from "../../src/config/database.js";
 import { loadConfig } from "../../src/config/env.js";
 import { beginTotpSetup, confirmTotpSetup, login, register } from "../../src/services/auth.service.js";
@@ -78,7 +79,7 @@ before(async () => {
   await mongoose.connect(integrationUri!, { autoIndex: false });
   const hello = await mongoose.connection.db!.admin().command({ hello: 1 });
   if (!isTransactionCapableHello(hello as Readonly<Record<string, unknown>>)) throw new Error("Integration database is not transaction-capable.");
-  await Promise.all([UserModel.createIndexes(), UserCredentialModel.createIndexes(), AuthSessionModel.createIndexes(), PlatformGrantModel.createIndexes(), OrganizationModel.createIndexes(), OrganizationMembershipModel.createIndexes(), OrganizationInvitationModel.createIndexes(), AuditEventModel.createIndexes(), CourseModel.createIndexes(), LessonModel.createIndexes(), EnrollmentModel.createIndexes(), LessonProgressModel.createIndexes()]);
+  await Promise.all([UserModel.createIndexes(), UserCredentialModel.createIndexes(), AuthSessionModel.createIndexes(), PlatformGrantModel.createIndexes(), OrganizationModel.createIndexes(), OrganizationMembershipModel.createIndexes(), OrganizationInvitationModel.createIndexes(), AuditEventModel.createIndexes(), CourseModel.createIndexes(), LessonModel.createIndexes(), EnrollmentModel.createIndexes(), LessonProgressModel.createIndexes(), MediaAssetModel.createIndexes(), MediaUploadIntentModel.createIndexes()]);
   assert.equal(await isDatabaseReady(), true);
 });
 

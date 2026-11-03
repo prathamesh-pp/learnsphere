@@ -4,10 +4,12 @@ import { CourseModel } from "../models/course.model.js";
 import { EnrollmentModel } from "../models/enrollment.model.js";
 import { LessonModel } from "../models/lesson.model.js";
 import { LessonProgressModel } from "../models/lesson-progress.model.js";
+import { MediaAssetModel } from "../models/media-asset.model.js";
 import { OrganizationMembershipModel } from "../models/organization-membership.model.js";
 import { OrganizationModel } from "../models/organization.model.js";
 import { UserModel } from "../models/user.model.js";
 import { rolesAllow } from "./organization.service.js";
+import { getPrivateAssetStorage } from "./private-asset-storage.service.js";
 
 export class CourseError extends Error { constructor(readonly status: 400 | 403 | 404 | 409 | 422, readonly code: string) { super(code); } }
 const isDuplicate = (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === 11000;
@@ -18,10 +20,14 @@ function audit(tenantId: Types.ObjectId, actorId: Types.ObjectId, action: string
 function courseDto(course: { toObject?: () => unknown; _id: Types.ObjectId }) {
   const value = (typeof course.toObject === "function" ? course.toObject() : course) as Record<string, unknown>;
   delete value.mutationVersion; delete value.enrollmentVersion;
+  if (Array.isArray(value.sections)) {
+    const sections = value.sections as Record<string, unknown>[];
+    value.sections = sections.slice().sort((a, b) => Number(a.position) - Number(b.position)).map((item) => ({ ...item, id: String(item._id), _id: undefined }));
+  }
   return { ...value, id: String(value._id), _id: undefined };
 }
 function lessonMetadata(lesson: Record<string, unknown>) {
-  return { id: String(lesson._id), title: lesson.title, description: lesson.description, contentType: lesson.contentType, estimatedDurationMinutes: lesson.estimatedDurationMinutes, position: lesson.position };
+  return { id: String(lesson._id), sectionId: lesson.sectionId ? String(lesson.sectionId) : null, title: lesson.title, description: lesson.description, contentType: lesson.contentType, estimatedDurationMinutes: lesson.estimatedDurationMinutes, position: lesson.position };
 }
 function escapeRegex(value: string) { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function cursorEncode(createdAt: Date, objectId: Types.ObjectId) { return Buffer.from(JSON.stringify({ createdAt: createdAt.toISOString(), id: objectId.toString() })).toString("base64url"); }
@@ -142,8 +148,10 @@ export async function publishCourse(actorId: string, courseId: string, requestId
     await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
     const lessons = await LessonModel.find({ tenantId, courseId: course._id, status: "draft" }).session(session);
     if (!lessons.length) throw new CourseError(422, "COURSE_REQUIRES_LESSONS");
+    if (lessons.some((lesson) => ["video", "document", "resource"].includes(lesson.contentType) && !lesson.contentData)) throw new CourseError(422, "LESSON_MEDIA_REQUIRED");
     const publishedAt = new Date();
     await LessonModel.updateMany({ tenantId, courseId: course._id, status: "draft" }, { $set: { status: "published" } }, { session });
+    for (const section of course.sections) section.status = "published";
     course.status = "published"; course.publishedAt = publishedAt; await course.save({ session });
     await AuditEventModel.create([audit(tenantId, actor, "course.published", "course", course.id, requestId, { lessonCount: lessons.length })], { session });
     return courseDto(course);
@@ -238,9 +246,9 @@ export async function listMyEnrollments(actorId: string) {
 export async function getMyEnrollment(actorId: string, enrollmentId: string) {
   const actor = id(actorId); const { enrollment, course } = await studentEnrollment(actor, enrollmentId);
   const lessons = await LessonModel.find({ tenantId: course.tenantId, courseId: course._id, status: "published" }).sort({ position: 1 }).lean();
-  const progress = await LessonProgressModel.find({ tenantId: course.tenantId, courseId: course._id, enrollmentId: enrollment._id, studentId: actor }).select("lessonId isComplete completedAt lastAccessedAt").lean();
+  const progress = await LessonProgressModel.find({ tenantId: course.tenantId, courseId: course._id, enrollmentId: enrollment._id, studentId: actor }).select("lessonId isComplete completedAt lastAccessedAt videoProgress").lean();
   const progressByLesson = new Map(progress.map((item) => [item.lessonId.toString(), item]));
-  return { enrollment: { id: enrollment.id, status: enrollment.status, startedAt: enrollment.startedAt, completedAt: enrollment.completedAt ?? null, progress: enrollment.progress }, course: courseDto(course), lessons: lessons.map((lesson) => ({ ...lessonMetadata(lesson as Record<string, unknown>), progress: progressByLesson.get(lesson._id.toString()) ? { isComplete: progressByLesson.get(lesson._id.toString())!.isComplete, completedAt: progressByLesson.get(lesson._id.toString())!.completedAt ?? null, lastAccessedAt: progressByLesson.get(lesson._id.toString())!.lastAccessedAt } : { isComplete: false, completedAt: null, lastAccessedAt: null } })) };
+  return { enrollment: { id: enrollment.id, status: enrollment.status, startedAt: enrollment.startedAt, completedAt: enrollment.completedAt ?? null, progress: enrollment.progress }, course: courseDto(course), lessons: lessons.map((lesson) => ({ ...lessonMetadata(lesson as Record<string, unknown>), progress: progressByLesson.get(lesson._id.toString()) ? { isComplete: progressByLesson.get(lesson._id.toString())!.isComplete, completedAt: progressByLesson.get(lesson._id.toString())!.completedAt ?? null, lastAccessedAt: progressByLesson.get(lesson._id.toString())!.lastAccessedAt, videoProgress: progressByLesson.get(lesson._id.toString())!.videoProgress ?? null } : { isComplete: false, completedAt: null, lastAccessedAt: null, videoProgress: null } })) };
 }
 
 export async function accessLesson(actorId: string, courseId: string, lessonId: string) {
@@ -259,6 +267,43 @@ export async function accessLesson(actorId: string, courseId: string, lessonId: 
   });
 }
 
+function lessonVideoDurationSeconds(lesson: { contentType: string; contentData?: { type?: string; durationSeconds?: number }; estimatedDurationMinutes?: number }) {
+  if (lesson.contentData?.type === "video" && Number.isInteger(lesson.contentData.durationSeconds)) return lesson.contentData.durationSeconds!;
+  if (lesson.contentType === "external_video" && lesson.estimatedDurationMinutes && lesson.estimatedDurationMinutes > 0) return lesson.estimatedDurationMinutes * 60;
+  return 0;
+}
+
+export async function recordVideoProgress(actorId: string, courseId: string, lessonId: string, positionSeconds: number) {
+  const actor = id(actorId); const courseIdObject = id(courseId); const lessonIdObject = id(lessonId);
+  return mongoose.connection.transaction(async (session) => {
+    const course = await CourseModel.findOne({ _id: courseIdObject, ownerScope: "organization", status: "published" }).session(session);
+    if (!course?.tenantId) throw new CourseError(404, "NOT_FOUND");
+    await lockCourse(session, { _id: course._id, tenantId: course.tenantId }, ["published"]);
+    await lockMembership(session, actor, course.tenantId, "course.read");
+    const lesson = await LessonModel.findOne({ _id: lessonIdObject, tenantId: course.tenantId, courseId: course._id, status: "published" }).session(session);
+    if (!lesson) throw new CourseError(404, "NOT_FOUND");
+    const duration = lessonVideoDurationSeconds(lesson);
+    if (!duration) throw new CourseError(409, "VIDEO_DURATION_UNAVAILABLE");
+    const enrollment = await EnrollmentModel.findOneAndUpdate({ tenantId: course.tenantId, courseId: course._id, studentId: actor, status: { $in: ["active", "completed"] } }, { $inc: { progressVersion: 1 } }, { new: true, session }).select("+progressVersion");
+    if (!enrollment) throw new CourseError(403, "ENROLLMENT_REQUIRED");
+    const now = new Date(); const boundedPosition = Math.min(positionSeconds, duration);
+    const progress = await LessonProgressModel.findOne({ tenantId: course.tenantId, courseId: course._id, enrollmentId: enrollment._id, lessonId: lesson._id, studentId: actor }).session(session);
+    const previous = progress?.videoProgress;
+    const elapsedSeconds = previous?.lastHeartbeatAt ? Math.max(0, Math.min(30, (now.getTime() - previous.lastHeartbeatAt.getTime()) / 1000)) : 0;
+    const forwardSeconds = previous ? Math.max(0, boundedPosition - previous.lastPositionSeconds) : 0;
+    const creditedSeconds = Math.min(forwardSeconds, elapsedSeconds * 1.25);
+    const watchedSeconds = Math.min(duration, (previous?.watchedSeconds ?? 0) + creditedSeconds);
+    if (progress) {
+      progress.videoProgress = { watchedSeconds, lastPositionSeconds: boundedPosition, lastHeartbeatAt: now };
+      progress.lastAccessedAt = now;
+      await progress.save({ session });
+    } else {
+      await LessonProgressModel.create([{ tenantId: course.tenantId, courseId: course._id, enrollmentId: enrollment._id, lessonId: lesson._id, studentId: actor, isComplete: false, lastAccessedAt: now, videoProgress: { watchedSeconds: 0, lastPositionSeconds: boundedPosition, lastHeartbeatAt: now } }], { session });
+    }
+    return { lessonId: lesson.id, durationSeconds: duration, watchedSeconds: Math.floor(watchedSeconds), completionThresholdSeconds: Math.ceil(duration * 0.9) };
+  });
+}
+
 export async function completeLesson(actorId: string, courseId: string, lessonId: string, requestId: string) {
   const actor = id(actorId); const courseIdObject = id(courseId); const lessonIdObject = id(lessonId);
   return mongoose.connection.transaction(async (session) => {
@@ -271,6 +316,8 @@ export async function completeLesson(actorId: string, courseId: string, lessonId
     const enrollment = await EnrollmentModel.findOneAndUpdate({ tenantId: course.tenantId, courseId: course._id, studentId: actor, status: { $in: ["active", "completed"] } }, { $inc: { progressVersion: 1 } }, { new: true, session }).select("+progressVersion");
     if (!enrollment) throw new CourseError(403, "ENROLLMENT_REQUIRED");
     const existing = await LessonProgressModel.findOne({ tenantId: course.tenantId, courseId: course._id, enrollmentId: enrollment._id, lessonId: lesson._id, studentId: actor }).session(session);
+    const videoDuration = lessonVideoDurationSeconds(lesson);
+    if ((lesson.contentType === "video" || lesson.contentType === "external_video") && (!videoDuration || (existing?.videoProgress?.watchedSeconds ?? 0) < Math.ceil(videoDuration * 0.9))) throw new CourseError(409, "VIDEO_WATCH_THRESHOLD_NOT_MET");
     const now = new Date(); let newlyCompleted = false;
     if (existing) {
       if (!existing.isComplete) { existing.isComplete = true; existing.completedAt = now; newlyCompleted = true; }
@@ -295,14 +342,15 @@ export async function listManagedLessons(actorId: string, courseId: string) {
   return lessons.map((lesson) => ({ ...lesson, id: lesson._id.toString(), _id: undefined }));
 }
 
-export async function createLesson(actorId: string, courseId: string, input: Record<string, unknown>, requestId: string) {
+export async function createLesson(actorId: string, courseId: string, input: Record<string, unknown> & { sectionId?: string | null }, requestId: string) {
   const actor = id(actorId);
   return mongoose.connection.transaction(async (session) => {
     const { course, tenantId } = await managedCourse(courseId, actorId, session);
     await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
+    if (input.sectionId && !course.sections.id(id(input.sectionId))) throw new CourseError(404, "NOT_FOUND");
     const position = await LessonModel.countDocuments({ tenantId, courseId: course._id }).session(session);
     if (position >= 200) throw new CourseError(409, "LESSON_LIMIT");
-    const [lesson] = await LessonModel.create([{ ...input, tenantId, courseId: course._id, position, status: "draft" }], { session });
+    const [lesson] = await LessonModel.create([{ ...input, sectionId: input.sectionId ? id(input.sectionId) : null, tenantId, courseId: course._id, position, status: "draft" }], { session });
     if (!lesson) throw new Error("Lesson was not created.");
     await recalculateCourseDuration(course, tenantId, session);
     await AuditEventModel.create([audit(tenantId, actor, "course.lesson.created", "lesson", lesson.id, requestId, { courseId: course.id })], { session });
@@ -326,15 +374,117 @@ export async function updateLesson(actorId: string, courseId: string, lessonId: 
 
 export async function deleteLesson(actorId: string, courseId: string, lessonId: string, requestId: string) {
   const actor = id(actorId); const lessonObjectId = id(lessonId);
-  return mongoose.connection.transaction(async (session) => {
+  let mediaToDelete: { _id: Types.ObjectId; publicId: string; resourceType: "video" | "raw"; tenantId: Types.ObjectId }[] = [];
+  await mongoose.connection.transaction(async (session) => {
     const { course, tenantId } = await managedCourse(courseId, actorId, session);
     await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
     const lesson = await LessonModel.findOne({ _id: lessonObjectId, tenantId, courseId: course._id, status: "draft" }).session(session);
     if (!lesson) throw new CourseError(404, "NOT_FOUND");
+    mediaToDelete = await MediaAssetModel.find({ tenantId, courseId: course._id, lessonId: lesson._id, state: "ready" }).session(session).lean();
+    if (mediaToDelete.length) {
+      await MediaAssetModel.updateMany({ tenantId, courseId: course._id, lessonId: lesson._id, state: "ready" }, { $set: { state: "deletion_requested", deletionRequestedAt: new Date() } }, { session });
+      await AuditEventModel.create(mediaToDelete.map((asset) => audit(tenantId, actor, "course.media.deletion_requested", "mediaAsset", String(asset._id), requestId, { courseId: course.id, lessonId: lesson.id, reason: "lesson_deleted" })), { session });
+    }
     await LessonModel.deleteOne({ _id: lesson._id, tenantId, courseId: course._id }, { session });
+    await LessonProgressModel.deleteMany({ tenantId, courseId: course._id, lessonId: lesson._id }, { session });
+    const enrollments = await EnrollmentModel.find({ tenantId, courseId: course._id }).session(session);
+    const totalLessons = await LessonModel.countDocuments({ tenantId, courseId: course._id, status: "published" }).session(session);
+    for (const enrollment of enrollments) {
+      const completedLessons = await LessonProgressModel.countDocuments({ tenantId, courseId: course._id, enrollmentId: enrollment._id, studentId: enrollment.studentId, isComplete: true }).session(session);
+      enrollment.progress = { completedLessons, totalLessons, percent: totalLessons ? Math.floor(completedLessons * 100 / totalLessons) : 0 };
+      await enrollment.save({ session });
+    }
     await compactLessonOrder(session, tenantId, course._id);
     await recalculateCourseDuration(course, tenantId, session);
     await AuditEventModel.create([audit(tenantId, actor, "course.lesson.deleted", "lesson", lesson.id, requestId, { courseId: course.id })], { session });
+  });
+  for (const asset of mediaToDelete) {
+    try {
+      await getPrivateAssetStorage().deleteAsset({ publicId: asset.publicId, resourceType: asset.resourceType });
+      await mongoose.connection.transaction(async (session) => {
+        const deleted = await MediaAssetModel.findOneAndUpdate({ _id: asset._id, tenantId: asset.tenantId, state: "deletion_requested" }, { $set: { state: "deleted", deletedAt: new Date() } }, { new: true, session });
+        if (deleted) await AuditEventModel.create([audit(asset.tenantId, actor, "course.media.deleted", "mediaAsset", String(asset._id), requestId, { reason: "lesson_deleted" })], { session });
+      });
+    } catch { /* Reconciliation retries deletion; the requested state blocks delivery meanwhile. */ }
+  }
+}
+
+export async function createSection(actorId: string, courseId: string, input: { title: string; description?: string }, requestId: string) {
+  const actor = id(actorId);
+  return mongoose.connection.transaction(async (session) => {
+    const { course, tenantId } = await managedCourse(courseId, actorId, session);
+    await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
+    if (course.sections.length >= 100) throw new CourseError(409, "SECTION_LIMIT");
+    const section = course.sections.create({ ...input, position: course.sections.length, status: "draft" });
+    course.sections.push(section); await course.save({ session });
+    await AuditEventModel.create([audit(tenantId, actor, "course.section.created", "section", section.id, requestId, { courseId: course.id })], { session });
+    return { ...section.toObject(), id: section.id };
+  });
+}
+
+export async function updateSection(actorId: string, courseId: string, sectionId: string, input: { title?: string; description?: string }, requestId: string) {
+  const actor = id(actorId); const sectionObjectId = id(sectionId);
+  return mongoose.connection.transaction(async (session) => {
+    const { course, tenantId } = await managedCourse(courseId, actorId, session);
+    await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
+    const section = course.sections.id(sectionObjectId);
+    if (!section) throw new CourseError(404, "NOT_FOUND");
+    Object.assign(section, input); await course.save({ session });
+    await AuditEventModel.create([audit(tenantId, actor, "course.section.updated", "section", section.id, requestId, { courseId: course.id, changedFields: Object.keys(input) })], { session });
+    return { ...section.toObject(), id: section.id };
+  });
+}
+
+export async function deleteSection(actorId: string, courseId: string, sectionId: string, requestId: string) {
+  const actor = id(actorId); const sectionObjectId = id(sectionId);
+  return mongoose.connection.transaction(async (session) => {
+    const { course, tenantId } = await managedCourse(courseId, actorId, session);
+    await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
+    const section = course.sections.id(sectionObjectId);
+    if (!section) throw new CourseError(404, "NOT_FOUND");
+    if (await LessonModel.exists({ tenantId, courseId: course._id, sectionId: sectionObjectId }).session(session)) throw new CourseError(409, "SECTION_NOT_EMPTY");
+    const sectionTitle = section.title;
+    section.deleteOne();
+    course.sections.forEach((item, index) => { item.position = index; });
+    await course.save({ session });
+    await AuditEventModel.create([audit(tenantId, actor, "course.section.deleted", "section", sectionId, requestId, { courseId: course.id, title: sectionTitle })], { session });
+  });
+}
+
+export async function reorderSections(actorId: string, courseId: string, sectionIds: string[], requestId: string) {
+  const actor = id(actorId); const requested = sectionIds.map(id);
+  return mongoose.connection.transaction(async (session) => {
+    const { course, tenantId } = await managedCourse(courseId, actorId, session);
+    await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
+    if (course.sections.length !== requested.length || requested.some((sectionId) => !course.sections.id(sectionId))) throw new CourseError(422, "INVALID_SECTION_ORDER");
+    const ordered = requested.map((sectionId) => course.sections.id(sectionId)!);
+    ordered.forEach((section, index) => { section.position = index; });
+    await course.save({ session });
+    await AuditEventModel.create([audit(tenantId, actor, "course.sections.reordered", "course", course.id, requestId, { sectionCount: ordered.length })], { session });
+    return course.sections.slice().sort((a, b) => a.position - b.position).map((section) => ({ ...section.toObject(), id: section.id }));
+  });
+}
+
+export async function moveLesson(actorId: string, courseId: string, lessonId: string, sectionId: string | null, position: number, requestId: string) {
+  const actor = id(actorId); const lessonObjectId = id(lessonId); const sectionObjectId = sectionId === null ? null : id(sectionId);
+  return mongoose.connection.transaction(async (session) => {
+    const { course, tenantId } = await managedCourse(courseId, actorId, session);
+    await lockCourse(session, { _id: course._id, tenantId }, ["draft"]);
+    if (sectionObjectId && !course.sections.id(sectionObjectId)) throw new CourseError(404, "NOT_FOUND");
+    const lesson = await LessonModel.findOne({ _id: lessonObjectId, tenantId, courseId: course._id, status: "draft" }).session(session);
+    if (!lesson) throw new CourseError(404, "NOT_FOUND");
+    const peerFilter = { tenantId, courseId: course._id, _id: { $ne: lesson._id }, sectionId: sectionObjectId };
+    const peers = await LessonModel.find(peerFilter).sort({ position: 1 }).session(session);
+    if (position > peers.length) throw new CourseError(422, "INVALID_LESSON_POSITION");
+    const all = await LessonModel.find({ tenantId, courseId: course._id }).session(session);
+    for (let index = 0; index < all.length; index++) await LessonModel.updateOne({ _id: all[index]!._id, tenantId, courseId: course._id }, { $set: { position: 200 + index } }, { session });
+    const sequence = peers.map((item) => item._id); sequence.splice(position, 0, lesson._id);
+    const otherGroups = all.filter((item) => !item._id.equals(lesson._id) && item.sectionId?.toString() !== sectionObjectId?.toString());
+    const finalOrder = [...otherGroups.map((item) => item._id), ...sequence];
+    for (let index = 0; index < finalOrder.length; index++) await LessonModel.updateOne({ _id: finalOrder[index]!, tenantId, courseId: course._id }, { $set: { position: index, ...(finalOrder[index]!.equals(lesson._id) ? { sectionId: sectionObjectId } : {}) } }, { session });
+    const moved = await LessonModel.findById(lesson._id).session(session);
+    await AuditEventModel.create([audit(tenantId, actor, "course.lesson.moved", "lesson", lesson.id, requestId, { courseId: course.id, sectionId, position })], { session });
+    return moved?.toObject();
   });
 }
 

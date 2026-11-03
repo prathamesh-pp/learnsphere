@@ -1,6 +1,6 @@
 # LearnSphere system architecture
 
-**Status:** modular monolith target architecture; identity, organization access, and the Phase 4 course workflow are implemented in a Vite frontend, Express API, and shared TypeScript package. Redis/workers, media, payments, and other integrations remain planned.
+**Status:** modular monolith. Identity, organization access, courses, structured curriculum, validated lesson content, and guarded video progress are implemented in the Vite frontend and Express API. AWS S3/CloudFront, Redis/BullMQ workers, FFmpeg, malware scanning, and private asset delivery are target architecture only and are not configured in this repository.
 
 ## Architecture principles
 
@@ -131,13 +131,16 @@ Global course definitions are owned by the platform or an instructor under the a
 
 ## Media storage and delivery
 
-- S3 buckets are private and encrypted; separate original uploads, processed media, and temporary/quarantine objects by lifecycle and access policy.
-- Browser requests short-lived presigned multipart upload grants after API authorization, per-file/per-tenant quotas, allowed extension and detected content-type checks, size/duration limits, checksum binding, and server-generated object keys. Expire grants; abort incomplete multipart uploads and clean abandoned quarantine objects.
-- All uploads remain private and quarantined until mandatory malware/content scanning and required media validation complete. If scanning is unavailable or fails, fail closed: the asset remains unavailable. Never trust the client MIME type. Handle archive expansion limits and parser resource exhaustion.
-- CloudFront serves private playback/download only with short-lived signed URL/cookie authorization issued after current membership, consent, entitlement, and resource-state checks. Bound cache and grant lifetime; revoke future grants immediately and ensure already issued grants expire within the documented maximum window. Deletion also removes S3 originals/renditions and invalidates or expires cached copies; cache invalidation is not the sole authorization control.
-- Store object key, owner/tenant, checksum, media metadata, processing state, retention, and access class in MongoDB; do not persist a public URL as the access authority.
-- FFmpeg creates approved transcodes/thumbnails/captions where configured. Recording requires informed consent, visibility rules, retention/deletion, and provider egress/transcoding cost controls.
-- FFmpeg workers use least-privilege identities, isolated temporary storage, patched pinned images, strict CPU/memory/time/output limits, argument arrays (never shell-concatenated user input), and no network access by default. Scanning/transcoding errors never publish a partial asset.
+The API has a replaceable private-asset provider interface and an official Cloudinary SDK adapter. `MEDIA_STORAGE_PROVIDER=unconfigured` remains the fail-closed fallback. Upload grants require current instructor permission, active organization membership, a draft course, and a matching existing lesson. The API streams file bytes to Cloudinary, so provider credentials are not returned to the browser. The SDK signs the provider request server-side. A byte-counting stream enforces limits; upload response signatures and Admin API metadata are verified before a transaction records ownership and attaches the asset.
+
+- Cloudinary assets use `authenticated` delivery. Before access, the API rechecks current membership, course/lesson publication, active enrollment and exact tenant/course/lesson asset ownership, then returns a five-minute signed private-download URL. Protected API responses are `Cache-Control: no-store, private`; signed URLs remain bearer access until expiry.
+- `CLOUDINARY_PRIVATE_DELIVERY_VERIFIED` must stay false until real account tests confirm private video and raw PDF/resource delivery. Cloudinary Free accounts can have PDF/archive delivery disabled by default; enable only needed settings and test them before enabling delivery.
+- Enforce 100,000,000 bytes for MP4 video and 10,000,000 bytes for raw documents/resources. Check allowlisted extension/MIME pairs and compare provider-reported format/resource type/size to the server intent. Never trust client URL, public ID, tenant ID or asset ID.
+- Upload intents and assets are durable. Expired/failed upload IDs and deletion-requested assets are reconciled idempotently; deletion state blocks student delivery while retries run. CDN cache removal is not instant and is not promised.
+- Cloudinary Free has 25 shared monthly credits. This does not guarantee storage, bandwidth, transformation or processing capacity. The application does not automatically upgrade the plan.
+- Redis, BullMQ, FFmpeg, malware scanning, transcodes, thumbnails and captions remain future work. Current media is stored/delivered as uploaded; no scan/transcode result is claimed. The in-process cleanup interval is suitable only for a small deployment; move it to a durable leased worker before horizontal scale.
+
+See [Cloudinary media setup and verification](../media/cloudinary.md) for account setup, the safe smoke test, and Free-plan limitations.
 
 ## External callback and webhook safety
 

@@ -15,6 +15,8 @@ test("loads safe defaults and validates the MongoDB URI and web origin", () => {
   assert.equal(config.nodeEnv, "test");
   assert.equal(config.apiPort, 4000);
   assert.equal(config.mongoServerSelectionTimeoutMs, 5000);
+  assert.equal(config.mediaStorageProvider, "unconfigured");
+  assert.equal(config.cloudinaryPrivateDeliveryVerified, false);
   assert.equal(config.webOrigin, "http://localhost:5173");
   assert.equal(config.sessionIdleTimeoutSeconds, 1800);
   assert.equal(config.platformAdminMfaMaxAgeSeconds, 43200);
@@ -47,4 +49,17 @@ test("requires HTTPS origins in production", () => {
     () => loadConfig({ ...validEnvironment, NODE_ENV: "production" }),
     (error: unknown) => error instanceof ConfigurationError && /WEB_ORIGIN/.test(error.message),
   );
+});
+
+test("does not accept unsupported media provider modes", () => {
+  assert.throws(() => loadConfig({ ...validEnvironment, MEDIA_STORAGE_PROVIDER: "s3" }), (error: unknown) => error instanceof ConfigurationError && /MEDIA_STORAGE_PROVIDER/.test(error.message));
+});
+
+test("requires all server-side Cloudinary configuration when enabled and never reports values", () => {
+  assert.throws(() => loadConfig({ ...validEnvironment, MEDIA_STORAGE_PROVIDER: "cloudinary", CLOUDINARY_CLOUD_NAME: "cloud", CLOUDINARY_API_KEY: "key" }), (error: unknown) => error instanceof ConfigurationError && /CLOUDINARY_API_SECRET/.test(error.message) && !/key|cloud/.test(error.message));
+  const config = loadConfig({ ...validEnvironment, MEDIA_STORAGE_PROVIDER: "cloudinary", CLOUDINARY_CLOUD_NAME: "test-cloud", CLOUDINARY_API_KEY: "test-key", CLOUDINARY_API_SECRET: "secret-value" });
+  assert.equal(config.mediaStorageProvider, "cloudinary");
+  assert.equal(config.cloudinaryApiSecret, "secret-value");
+  assert.equal(config.cloudinaryPrivateDeliveryVerified, false);
+  assert.equal(loadConfig({ ...validEnvironment, MEDIA_STORAGE_PROVIDER: "cloudinary", CLOUDINARY_CLOUD_NAME: "cloud", CLOUDINARY_API_KEY: "key", CLOUDINARY_API_SECRET: "secret", CLOUDINARY_PRIVATE_DELIVERY_VERIFIED: "true" }).cloudinaryPrivateDeliveryVerified, true);
 });

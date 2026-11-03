@@ -8,6 +8,7 @@ LearnSphere is a full-stack learning management system focused on organization-s
 - Organization membership and permission checks with tenant-scoped course management.
 - Instructor course and lesson authoring, publishing, and archiving.
 - Course discovery, enrollment, protected lesson content, and progress tracking.
+- Structured rich-text lessons, HTTPS learning links, server-limited external video playback, and optional Cloudinary-backed private video/PDF/resource uploads. Media fails closed until Cloudinary is configured; private delivery stays disabled until the account's real video and raw-file smoke tests are confirmed.
 - API and frontend tests, including isolated MongoDB replica-set integration tests.
 
 Paid courses, payments, certificates, video hosting, assessments, cohorts, live classes, jobs, and advanced analytics are not implemented.
@@ -45,6 +46,8 @@ TypeScript, React, Vite, Redux Toolkit Query, Node.js, Express, MongoDB/Mongoose
 
    Put the generated value in `MFA_ENCRYPTION_KEY`. The example file contains placeholders and development defaults only. Never use its key placeholder as a real key.
 
+   To enable Cloudinary, set `MEDIA_STORAGE_PROVIDER=cloudinary` and set `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in the API environment only. Keep `CLOUDINARY_PRIVATE_DELIVERY_VERIFIED=false` until completing the real-account procedure in [Cloudinary media setup](docs/media/cloudinary.md). Never put these values in `apps/web/.env*` or a `VITE_` variable. The API streams uploads to Cloudinary using the official server SDK; credentials are not returned to the browser.
+
 3. Start the API and web app:
 
    ```sh
@@ -70,4 +73,4 @@ Integration tests require `LMS_INTEGRATION_MONGODB_URI` pointing to a loopback M
 
 ## Implementation status
 
-The implemented workflow is organization-scoped course authoring and learner progress, supported by identity, session, membership, and authorization foundations. Architecture documents also describe planned capabilities; their future-state proposals should not be read as implemented features. Production deployment, external email delivery, payment processing, and media hosting are not configured by this repository.
+The implemented workflow is organization-scoped course authoring and learner progress, supported by identity, session, membership, and authorization foundations. The Cloudinary media adapter is implemented but requires the user's server-side account configuration and real-account verification before protected delivery is enabled. The Free account's 25 monthly credits are shared usage, not a guarantee of storage or bandwidth. Architecture documents also describe planned capabilities; their future-state proposals should not be read as implemented features. Production deployment, external email delivery and payment processing are not configured by this repository.

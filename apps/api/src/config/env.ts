@@ -24,6 +24,11 @@ const envSchema = z.object({
     .transform(Number)
     .pipe(z.number().int().min(1).max(65535)),
   MONGODB_URI: mongoUriSchema,
+  MEDIA_STORAGE_PROVIDER: z.enum(["unconfigured", "cloudinary"]).default("unconfigured"),
+  CLOUDINARY_CLOUD_NAME: z.string().trim().min(1).max(255).optional(),
+  CLOUDINARY_API_KEY: z.string().trim().min(1).max(255).optional(),
+  CLOUDINARY_API_SECRET: z.string().min(1).max(512).optional(),
+  CLOUDINARY_PRIVATE_DELIVERY_VERIFIED: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
   MONGODB_SERVER_SELECTION_TIMEOUT_MS: z.string().regex(/^\d+$/, "must be a whole number").default("5000")
     .transform(Number)
     .pipe(z.number().int().min(100).max(120000)),
@@ -49,12 +54,22 @@ const envSchema = z.object({
   if (config.PLATFORM_ADMIN_SENSITIVE_MFA_MAX_AGE_SECONDS > config.PLATFORM_ADMIN_MFA_MAX_AGE_SECONDS) {
     context.addIssue({ code: "custom", path: ["PLATFORM_ADMIN_SENSITIVE_MFA_MAX_AGE_SECONDS"], message: "must not exceed platform admin MFA max age" });
   }
+  if (config.MEDIA_STORAGE_PROVIDER === "cloudinary") {
+    for (const name of ["CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"] as const) {
+      if (!config[name]) context.addIssue({ code: "custom", path: [name], message: "is required when Cloudinary storage is enabled" });
+    }
+  }
 });
 
 export type AppConfig = Readonly<{
   nodeEnv: "development" | "test" | "production";
   apiPort: number;
   mongoUri: string;
+  mediaStorageProvider: "unconfigured" | "cloudinary";
+  cloudinaryCloudName?: string;
+  cloudinaryApiKey?: string;
+  cloudinaryApiSecret?: string;
+  cloudinaryPrivateDeliveryVerified: boolean;
   mongoServerSelectionTimeoutMs: number;
   webOrigin: string;
   sessionIdleTimeoutSeconds: number;
@@ -83,6 +98,9 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     nodeEnv: result.data.NODE_ENV,
     apiPort: result.data.API_PORT,
     mongoUri: result.data.MONGODB_URI,
+    mediaStorageProvider: result.data.MEDIA_STORAGE_PROVIDER,
+    cloudinaryPrivateDeliveryVerified: result.data.CLOUDINARY_PRIVATE_DELIVERY_VERIFIED,
+    ...(result.data.MEDIA_STORAGE_PROVIDER === "cloudinary" ? { cloudinaryCloudName: result.data.CLOUDINARY_CLOUD_NAME, cloudinaryApiKey: result.data.CLOUDINARY_API_KEY, cloudinaryApiSecret: result.data.CLOUDINARY_API_SECRET } : {}),
     mongoServerSelectionTimeoutMs: result.data.MONGODB_SERVER_SELECTION_TIMEOUT_MS,
     webOrigin: result.data.WEB_ORIGIN,
     sessionIdleTimeoutSeconds: result.data.SESSION_IDLE_TIMEOUT_SECONDS,

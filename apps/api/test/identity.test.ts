@@ -171,7 +171,10 @@ test("MFA TOTP secret is authenticated-encrypted and TOTP validation is time-bou
   const encrypted = encryptTotpSecret(secret, testConfig.mfaEncryptionKey);
   assert.equal(encrypted.includes(secret), false);
   assert.equal(decryptTotpSecret(encrypted, testConfig.mfaEncryptionKey), secret);
-  assert.throws(() => decryptTotpSecret(`${encrypted.slice(0, -2)}xx`, testConfig.mfaEncryptionKey));
+  const [version, iv, tag, ciphertext] = encrypted.split(".");
+  assert.ok(version && iv && tag && ciphertext);
+  const tamperedTag = `${tag[0] === "A" ? "B" : "A"}${tag.slice(1)}`;
+  assert.throws(() => decryptTotpSecret(`${version}.${iv}.${tamperedTag}.${ciphertext}`, testConfig.mfaEncryptionKey));
   const code = createTotp(secret, 1_800_000_000_000);
   assert.equal(verifyTotp(secret, code, 1_800_000_000_000), true);
   assert.equal(verifyTotp(secret, code, 1_800_000_090_000), false);

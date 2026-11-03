@@ -8,6 +8,11 @@ const progressSchema = new Schema({
   isComplete: { type: Boolean, required: true, default: false },
   completedAt: { type: Date },
   lastAccessedAt: { type: Date, required: true, default: Date.now },
+  videoProgress: {
+    watchedSeconds: { type: Number, min: 0, required: true, default: 0 },
+    lastPositionSeconds: { type: Number, min: 0, required: true, default: 0 },
+    lastHeartbeatAt: { type: Date },
+  },
 }, { timestamps: true, versionKey: false });
 progressSchema.index({ enrollmentId: 1, lessonId: 1 }, { unique: true });
 progressSchema.index({ tenantId: 1, courseId: 1, studentId: 1 });

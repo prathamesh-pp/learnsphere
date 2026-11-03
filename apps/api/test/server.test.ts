@@ -8,6 +8,8 @@ const config: AppConfig = {
   nodeEnv: "test",
   apiPort: 0,
   mongoUri: "mongodb://127.0.0.1:27017/lms_platform_test",
+  mediaStorageProvider: "unconfigured",
+  cloudinaryPrivateDeliveryVerified: false,
   mongoServerSelectionTimeoutMs: 100,
   webOrigin: "http://localhost:5173",
   sessionIdleTimeoutSeconds: 1800,

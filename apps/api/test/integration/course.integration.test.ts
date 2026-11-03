@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import mongoose, { Types } from "mongoose";
 import test, { after, afterEach, before } from "node:test";
 import { createServer, type Server } from "node:http";
@@ -9,6 +10,7 @@ import { CourseModel } from "../../src/models/course.model.js";
 import { EnrollmentModel } from "../../src/models/enrollment.model.js";
 import { LessonModel } from "../../src/models/lesson.model.js";
 import { LessonProgressModel } from "../../src/models/lesson-progress.model.js";
+import { MediaAssetModel, MediaUploadIntentModel } from "../../src/models/media-asset.model.js";
 import { OrganizationMembershipModel } from "../../src/models/organization-membership.model.js";
 import { OrganizationModel } from "../../src/models/organization.model.js";
 import { UserModel } from "../../src/models/user.model.js";
@@ -16,7 +18,9 @@ import { UserCredentialModel } from "../../src/models/user-credential.model.js";
 import { createApp } from "../../src/app.js";
 import { loadConfig } from "../../src/config/env.js";
 import { sha256 } from "../../src/services/session.service.js";
-import { accessLesson, archiveCourse, completeLesson, createCourse, createLesson, deleteLesson, enrollInCourse, getMyEnrollment, getPublishedCourse, listCourseDiscovery, listManagedCourses, listMyEnrollments, publishCourse, updateLesson } from "../../src/services/course.service.js";
+import { accessLesson, archiveCourse, completeLesson, createCourse, createLesson, createSection, deleteLesson, deleteSection, enrollInCourse, getMyEnrollment, getPublishedCourse, listCourseDiscovery, listManagedCourses, listMyEnrollments, moveLesson, publishCourse, recordVideoProgress, reorderLessons, reorderSections, updateLesson, updateSection } from "../../src/services/course.service.js";
+import { createLessonMediaUploadGrant, createStudentMediaAccess, deleteLessonMediaAsset, uploadAndVerifyLessonMedia } from "../../src/services/media.service.js";
+import { setPrivateAssetStorageProvider, UnconfiguredPrivateAssetStorage, type PrivateAssetStorageProvider, type PrivateUploadRequest, type ProviderAsset } from "../../src/services/private-asset-storage.service.js";
 
 const uri = process.env.LMS_INTEGRATION_MONGODB_URI;
 if (!uri) throw new Error("LMS_INTEGRATION_MONGODB_URI must explicitly point to the isolated test replica set.");
@@ -25,6 +29,18 @@ if (!(parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || pars
 const runId = randomUUID(); const userIds: Types.ObjectId[] = []; const orgIds: Types.ObjectId[] = []; const courseIds: Types.ObjectId[] = [];
 const csrfToken = "a".repeat(40);
 const testConfig = loadConfig({ NODE_ENV: "test", MONGODB_URI: uri, WEB_ORIGIN: "http://localhost:5173", MFA_ENCRYPTION_KEY: Buffer.alloc(32, 11).toString("base64url") });
+class IntegrationMediaProvider implements PrivateAssetStorageProvider {
+  readonly deletions: string[] = [];
+  reuseAssetId = false;
+  async createUploadGrant(request: PrivateUploadRequest) { return { intentId: request.intentId, uploadUrl: `/test-upload/${request.intentId}`, expiresAt: new Date(Date.now() + 600_000).toISOString(), maxSizeBytes: request.maxSizeBytes }; }
+  async upload(request: PrivateUploadRequest, source: NodeJS.ReadableStream): Promise<ProviderAsset> {
+    let bytes = 0; for await (const chunk of source) bytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+    return { assetId: this.reuseAssetId ? "shared-test-provider-id" : `provider-${request.intentId}`, publicId: request.publicId, resourceType: request.resourceType, deliveryType: "authenticated", format: request.purpose === "video" ? "mp4" : request.fileName.split(".").at(-1)!.toLowerCase(), sizeBytes: bytes, version: 1, responseSignature: "verified-test-signature", ...(request.purpose === "video" ? { durationSeconds: 60, width: 640, height: 360 } : {}) };
+  }
+  async getVerifiedAsset(_request: PrivateUploadRequest, uploaded: ProviderAsset) { return uploaded; }
+  async createDownloadGrant(input: { publicId: string; format: string; resourceType: "video" | "raw"; disposition: "inline" | "attachment" }) { return { url: `https://media.example.test/${input.resourceType}/${input.disposition}/${encodeURIComponent(input.publicId)}.${input.format}?expires=300`, expiresAt: new Date(Date.now() + 300_000).toISOString() }; }
+  async deleteAsset(input: { publicId: string; resourceType: "video" | "raw" }) { this.deletions.push(`${input.resourceType}:${input.publicId}`); }
+}
 let counter = 0;
 async function user(label: string) { const item = await UserModel.create({ emailNormalized: `course-${runId}-${++counter}@example.test`, displayName: label, status: "active" }); userIds.push(item._id); return item; }
 async function organization(owner: Types.ObjectId, members: { userId: Types.ObjectId; roles: string[] }[] = []) {
@@ -60,11 +76,11 @@ async function startApi() {
 }
 before(async () => {
   await mongoose.connect(uri!, { autoIndex: false });
-  await Promise.all([UserModel.createIndexes(), UserCredentialModel.createIndexes(), OrganizationModel.createIndexes(), OrganizationMembershipModel.createIndexes(), CourseModel.createIndexes(), LessonModel.createIndexes(), EnrollmentModel.createIndexes(), LessonProgressModel.createIndexes(), AuditEventModel.createIndexes()]);
+  await Promise.all([UserModel.createIndexes(), UserCredentialModel.createIndexes(), OrganizationModel.createIndexes(), OrganizationMembershipModel.createIndexes(), CourseModel.createIndexes(), LessonModel.createIndexes(), EnrollmentModel.createIndexes(), LessonProgressModel.createIndexes(), AuditEventModel.createIndexes(), MediaAssetModel.createIndexes(), MediaUploadIntentModel.createIndexes()]);
 });
 afterEach(async () => {
   if (orgIds.length) await Promise.all([OrganizationMembershipModel.deleteMany({ tenantId: { $in: orgIds } }), OrganizationModel.deleteMany({ _id: { $in: orgIds } })]);
-  if (courseIds.length) await Promise.all([CourseModel.deleteMany({ _id: { $in: courseIds } }), LessonModel.deleteMany({ courseId: { $in: courseIds } }), EnrollmentModel.deleteMany({ courseId: { $in: courseIds } }), LessonProgressModel.deleteMany({ courseId: { $in: courseIds } })]);
+  if (courseIds.length) await Promise.all([CourseModel.deleteMany({ _id: { $in: courseIds } }), LessonModel.deleteMany({ courseId: { $in: courseIds } }), EnrollmentModel.deleteMany({ courseId: { $in: courseIds } }), LessonProgressModel.deleteMany({ courseId: { $in: courseIds } }), MediaAssetModel.deleteMany({ courseId: { $in: courseIds } }), MediaUploadIntentModel.deleteMany({ courseId: { $in: courseIds } })]);
   if (userIds.length) await Promise.all([OrganizationMembershipModel.deleteMany({ userId: { $in: userIds } }), UserCredentialModel.deleteMany({ userId: { $in: userIds } }), AuditEventModel.deleteMany({ actorId: { $in: userIds } }), UserModel.deleteMany({ _id: { $in: userIds } })]);
   userIds.length = 0; orgIds.length = 0; courseIds.length = 0;
 });
@@ -136,6 +152,229 @@ test("lesson duration totals are recalculated transactionally after edits and de
   assert.equal((await CourseModel.findById(courseId).select("estimatedDurationMinutes").lean())?.estimatedDurationMinutes, 33);
   await deleteLesson(instructor.id, courseId, String(second._id), `req-${runId}`);
   assert.equal((await CourseModel.findById(courseId).select("estimatedDurationMinutes").lean())?.estimatedDurationMinutes, 25);
+});
+
+test("lesson deletion removes only scoped progress, updates enrollment aggregates and course duration, and audits", async () => {
+  const owner = await user("Owner"); const instructor = await user("Instructor"); const student = await user("Student"); const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }, { userId: student._id, roles: ["STUDENT"] }]);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `progress-cleanup-${counter}` }, `req-${runId}`); const courseId = new Types.ObjectId(String(course.id)); courseIds.push(courseId);
+  const first = await createLesson(instructor.id, String(course.id), lessonInput("Remove me", "One."), `req-${runId}`);
+  const keep = await createLesson(instructor.id, String(course.id), lessonInput("Keep me", "Two."), `req-${runId}`);
+  const unrelatedCourse = await createCourse(instructor.id, org.id, { ...courseInput, slug: `progress-unrelated-${counter}` }, `req-${runId}`); const unrelatedCourseId = new Types.ObjectId(String(unrelatedCourse.id)); courseIds.push(unrelatedCourseId);
+  const unrelatedLesson = await createLesson(instructor.id, String(unrelatedCourse.id), lessonInput("Other course", "Other."), `req-${runId}`);
+  const enrollment = await EnrollmentModel.create({ tenantId: org._id, courseId, studentId: student._id, status: "active", progress: { completedLessons: 1, totalLessons: 2, percent: 50 } });
+  const unrelatedEnrollment = await EnrollmentModel.create({ tenantId: org._id, courseId: unrelatedCourseId, studentId: student._id, status: "active", progress: { completedLessons: 0, totalLessons: 1, percent: 0 } });
+  await LessonProgressModel.create([
+    { tenantId: org._id, courseId, enrollmentId: enrollment._id, studentId: student._id, lessonId: first._id, isComplete: true, completedAt: new Date() },
+    { tenantId: org._id, courseId, enrollmentId: enrollment._id, studentId: student._id, lessonId: keep._id, isComplete: false },
+    { tenantId: org._id, courseId: unrelatedCourseId, enrollmentId: unrelatedEnrollment._id, studentId: student._id, lessonId: unrelatedLesson._id, isComplete: false },
+  ]);
+  await deleteLesson(instructor.id, String(course.id), String(first._id), `req-${runId}`);
+  assert.equal(await LessonProgressModel.countDocuments({ enrollmentId: enrollment._id, lessonId: first._id }), 0);
+  assert.equal(await LessonProgressModel.countDocuments({ enrollmentId: enrollment._id }), 1);
+  assert.equal(await LessonProgressModel.countDocuments({ enrollmentId: unrelatedEnrollment._id }), 1);
+  const updatedEnrollment = await EnrollmentModel.findById(enrollment._id).lean();
+  assert.deepEqual(updatedEnrollment?.progress, { completedLessons: 0, totalLessons: 0, percent: 0 });
+  assert.equal((await CourseModel.findById(courseId).lean())?.estimatedDurationMinutes, 8);
+  assert.equal(await AuditEventModel.countDocuments({ tenantId: org._id, action: "course.lesson.deleted", resourceId: String(first._id) }), 1);
+});
+
+test("section CRUD, ordering and lesson movement preserve lesson identity and audit mutations", async () => {
+  const owner = await user("Owner"); const instructor = await user("Instructor"); const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }]);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `curriculum-${counter}` }, `req-${runId}`); const courseId = String(course.id); courseIds.push(new Types.ObjectId(courseId));
+  const firstSection = await createSection(instructor.id, courseId, { title: "Foundations", description: "Start here." }, `req-${runId}`);
+  const secondSection = await createSection(instructor.id, courseId, { title: "Practice" }, `req-${runId}`);
+  const lesson = await createLesson(instructor.id, courseId, { ...lessonInput("Origins", "Keep this ID."), sectionId: firstSection.id }, `req-${runId}`);
+  const practice = await createLesson(instructor.id, courseId, { ...lessonInput("Practice lesson", "Practice."), sectionId: secondSection.id }, `req-${runId}`);
+  const mutationVersionBeforeRejectedDelete = (await CourseModel.findById(courseId).select("+mutationVersion").lean())?.mutationVersion;
+  await assert.rejects(deleteSection(instructor.id, courseId, firstSection.id, `req-${runId}`), /SECTION_NOT_EMPTY/);
+  assert.equal((await CourseModel.findById(courseId).lean())?.sections.find((section) => String(section._id) === firstSection.id)?.title, "Foundations");
+  assert.equal(String((await LessonModel.findById(lesson._id).lean())?.sectionId), firstSection.id);
+  assert.equal((await CourseModel.findById(courseId).select("+mutationVersion").lean())?.mutationVersion, mutationVersionBeforeRejectedDelete);
+  await updateSection(instructor.id, courseId, firstSection.id, { title: "Foundations updated", description: "Updated." }, `req-${runId}`);
+  const reordered = await reorderSections(instructor.id, courseId, [secondSection.id, firstSection.id], `req-${runId}`);
+  assert.deepEqual(reordered.map((section) => section.id), [secondSection.id, firstSection.id]);
+  const moved = await moveLesson(instructor.id, courseId, String(lesson._id), secondSection.id, 0, `req-${runId}`);
+  assert.equal(String(moved?.sectionId), secondSection.id);
+  assert.equal(String(moved?._id), String(lesson._id));
+  const lessonOrder = await reorderLessons(instructor.id, courseId, [String(lesson._id), String(practice._id)], `req-${runId}`);
+  assert.deepEqual(lessonOrder.map((item) => String(item._id)), [String(lesson._id), String(practice._id)]);
+  await deleteSection(instructor.id, courseId, firstSection.id, `req-${runId}`);
+  assert.equal(await AuditEventModel.countDocuments({ tenantId: org._id, action: { $in: ["course.section.created", "course.section.updated", "course.sections.reordered", "course.lesson.moved", "course.lessons.reordered", "course.section.deleted"] } }), 7);
+});
+
+test("curriculum mutation rolls back when its audit event fails validation", async () => {
+  const owner = await user("Owner"); const instructor = await user("Instructor"); const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }]);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `curriculum-rollback-${counter}` }, `req-${runId}`); const courseId = String(course.id); courseIds.push(new Types.ObjectId(courseId));
+  const section = await createSection(instructor.id, courseId, { title: "Original title" }, `req-${runId}`);
+  const before = await CourseModel.findById(courseId).select("+mutationVersion").lean();
+  await assert.rejects(updateSection(instructor.id, courseId, section.id, { title: "Must roll back" }, "r".repeat(101)));
+  const after = await CourseModel.findById(courseId).select("+mutationVersion").lean();
+  assert.equal(after?.sections.find((item) => String(item._id) === section.id)?.title, "Original title");
+  assert.equal(after?.mutationVersion, before?.mutationVersion);
+  assert.equal(await AuditEventModel.countDocuments({ tenantId: org._id, action: "course.section.updated", resourceId: section.id }), 0);
+});
+
+test("curriculum writes serialize concurrent section creation and lesson reorder/move operations", async () => {
+  const owner = await user("Owner"); const instructor = await user("Instructor"); const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }]);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `curriculum-race-${counter}` }, `req-${runId}`); const courseId = String(course.id); courseIds.push(new Types.ObjectId(courseId));
+  const [first, second] = await Promise.all([
+    createSection(instructor.id, courseId, { title: "Concurrent A" }, `req-${runId}`),
+    createSection(instructor.id, courseId, { title: "Concurrent B" }, `req-${runId}`),
+  ]);
+  const [third, fourth] = await Promise.all([
+    createSection(instructor.id, courseId, { title: "Concurrent C" }, `req-${runId}`),
+    createSection(instructor.id, courseId, { title: "Concurrent D" }, `req-${runId}`),
+  ]);
+  const lessons = await Promise.all([
+    createLesson(instructor.id, courseId, { ...lessonInput("A", "A."), sectionId: first.id }, `req-${runId}`),
+    createLesson(instructor.id, courseId, { ...lessonInput("B", "B."), sectionId: second.id }, `req-${runId}`),
+  ]);
+  await Promise.all([
+    reorderLessons(instructor.id, courseId, [String(lessons[1]!._id), String(lessons[0]!._id)], `req-${runId}`),
+    moveLesson(instructor.id, courseId, String(lessons[0]!._id), second.id, 0, `req-${runId}`),
+  ]);
+  const storedSections = (await CourseModel.findById(courseId).lean())!.sections;
+  assert.deepEqual(storedSections.map((section) => section.position).sort((a, b) => a - b), [0, 1, 2, 3]);
+  const storedLessons = await LessonModel.find({ courseId: new Types.ObjectId(courseId) }).sort({ position: 1 }).lean();
+  assert.deepEqual(storedLessons.map((item) => item.position), [0, 1]);
+  assert.equal(storedLessons.find((item) => item._id.equals(lessons[0]!._id))?.sectionId?.toString(), second.id);
+  assert.ok([third.id, fourth.id].every((id) => storedSections.some((section) => String(section._id) === id)));
+});
+
+test("curriculum APIs enforce instructor, student, current-membership, course and tenant boundaries", async (context) => {
+  const owner = await user("Owner"); const instructor = await user("Instructor"); const peerInstructor = await user("Peer instructor"); const student = await user("Student"); const outsider = await user("Outsider");
+  const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }, { userId: peerInstructor._id, roles: ["INSTRUCTOR"] }, { userId: student._id, roles: ["STUDENT"] }]);
+  const foreignOrg = await organization(outsider._id);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `curriculum-auth-${counter}` }, `req-${runId}`); const courseId = String(course.id); courseIds.push(new Types.ObjectId(courseId));
+  const section = await createSection(instructor.id, courseId, { title: "Owned section" }, `req-${runId}`);
+  const lesson = await createLesson(instructor.id, courseId, { ...lessonInput("Owned lesson", "Private draft."), sectionId: section.id }, `req-${runId}`);
+  const foreignCourse = await createCourse(outsider.id, foreignOrg.id, { ...courseInput, slug: `foreign-curriculum-${counter}` }, `req-${runId}`); courseIds.push(new Types.ObjectId(String(foreignCourse.id)));
+  const foreignSection = await createSection(outsider.id, String(foreignCourse.id), { title: "Foreign section" }, `req-${runId}`);
+  const foreignLesson = await createLesson(outsider.id, String(foreignCourse.id), lessonInput("Foreign lesson", "Other tenant."), `req-${runId}`);
+  const api = await startApi(); context.after(async () => api.close());
+  const sectionPath = `/instructor/courses/${courseId}/sections/${section.id}`;
+  const lessonPath = `/instructor/courses/${courseId}/lessons/${lesson._id}`;
+  assert.equal((await api.request(`/instructor/courses/${courseId}/sections`, peerInstructor.id, { method: "POST", body: { title: "No access" } })).status, 404);
+  assert.equal((await api.request(sectionPath, peerInstructor.id, { method: "PATCH", body: { title: "No access" } })).status, 404);
+  assert.equal((await api.request(sectionPath, peerInstructor.id, { method: "DELETE" })).status, 404);
+  assert.equal((await api.request(`/instructor/courses/${courseId}/sections/order`, peerInstructor.id, { method: "PUT", body: { sectionIds: [section.id] } })).status, 404);
+  assert.equal((await api.request(`${lessonPath}/move`, peerInstructor.id, { method: "PUT", body: { sectionId: null, position: 0 } })).status, 404);
+  assert.equal((await api.request(`/instructor/courses/${courseId}/lessons/order`, peerInstructor.id, { method: "PUT", body: { lessonIds: [String(lesson._id)] } })).status, 404);
+  assert.equal((await api.request(`/instructor/courses/${courseId}/sections`, student.id, { method: "POST", body: { title: "Student write" } })).status, 404);
+  assert.equal((await api.request(sectionPath, student.id, { method: "PATCH", body: { title: "Student write" } })).status, 404);
+  assert.equal((await api.request(lessonPath, student.id, { method: "PATCH", body: lessonInput("Student write", "No." ) })).status, 404);
+  assert.equal((await api.request(sectionPath, instructor.id, { method: "PATCH", body: { title: "Foreign ID" } })).status, 200);
+  assert.equal((await api.request(`/instructor/courses/${courseId}/sections/${foreignSection.id}`, instructor.id, { method: "PATCH", body: { title: "Cross-course ID" } })).status, 404);
+  assert.equal((await api.request(`/instructor/courses/${courseId}/sections/order`, instructor.id, { method: "PUT", body: { sectionIds: [foreignSection.id] } })).status, 422);
+  assert.equal((await api.request(`${lessonPath}/move`, instructor.id, { method: "PUT", body: { sectionId: foreignSection.id, position: 0 } })).status, 404);
+  assert.equal((await api.request(`/instructor/courses/${courseId}/lessons/order`, instructor.id, { method: "PUT", body: { lessonIds: [String(foreignLesson._id)] } })).status, 422);
+  await OrganizationMembershipModel.updateOne({ tenantId: org._id, userId: instructor._id }, { $set: { status: "suspended" } });
+  assert.equal((await api.request(sectionPath, instructor.id, { method: "PATCH", body: { title: "Membership revoked" } })).status, 404);
+});
+
+test("students only receive published lesson metadata and must enroll before lesson content access", async (context) => {
+  const owner = await user("Owner"); const instructor = await user("Instructor"); const student = await user("Student");
+  const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }, { userId: student._id, roles: ["STUDENT"] }]);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `published-content-${counter}` }, `req-${runId}`); const courseId = String(course.id); courseIds.push(new Types.ObjectId(courseId));
+  const section = await createSection(instructor.id, courseId, { title: "Published section" }, `req-${runId}`);
+  const first = await createLesson(instructor.id, courseId, { ...lessonInput("Visible lesson", "Visible body."), sectionId: section.id }, `req-${runId}`);
+  const second = await createLesson(instructor.id, courseId, { ...lessonInput("Hidden lesson", "Secret unpublished body."), sectionId: section.id }, `req-${runId}`);
+  await publishCourse(instructor.id, courseId, `req-${runId}`);
+  const api = await startApi(); context.after(async () => api.close());
+  assert.equal((await api.request(`/courses/${courseId}/lessons/${first._id}`, student.id)).status, 403);
+  await enrollInCourse(student.id, courseId, `req-${runId}`);
+  await LessonModel.updateOne({ _id: second._id }, { $set: { status: "draft" } });
+  const outline = await api.request(`/courses/${courseId}`, student.id);
+  assert.deepEqual((outline.body as { data: { lessons: { id: string }[] } }).data.lessons.map((item) => item.id), [String(first._id)]);
+  const hidden = await api.request(`/courses/${courseId}/lessons/${second._id}`, student.id);
+  assert.equal(hidden.status, 404);
+  assert.doesNotMatch(JSON.stringify(hidden.body), /Secret unpublished body/);
+});
+
+test("video completion requires server-credited playback and uploads fail closed without private storage", async (context) => {
+  const owner = await user("Owner"); const instructor = await user("Instructor"); const peerInstructor = await user("Peer Instructor"); const student = await user("Student");
+  const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }, { userId: peerInstructor._id, roles: ["INSTRUCTOR"] }, { userId: student._id, roles: ["STUDENT"] }]);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `video-progress-${counter}` }, `req-${runId}`); const courseId = String(course.id); courseIds.push(new Types.ObjectId(courseId));
+  const lesson = await createLesson(instructor.id, courseId, { title: "Video", description: "", contentType: "video", contentData: { type: "video", source: "external", title: "Video", url: "https://cdn.example.test/video.mp4", durationSeconds: 60 }, resourceLinks: [], estimatedDurationMinutes: 1 }, `req-${runId}`);
+  await publishCourse(instructor.id, courseId, `req-${runId}`);
+  const enrollment = await enrollInCourse(student.id, courseId, `req-${runId}`);
+  await assert.rejects(completeLesson(student.id, courseId, String(lesson._id), `req-${runId}`), /VIDEO_WATCH_THRESHOLD_NOT_MET/);
+  await recordVideoProgress(student.id, courseId, String(lesson._id), 0);
+  const fastForward = await recordVideoProgress(student.id, courseId, String(lesson._id), 60);
+  assert.ok(fastForward.watchedSeconds < 54, "a client seek must not satisfy the video completion threshold");
+  await assert.rejects(completeLesson(student.id, courseId, String(lesson._id), `req-${runId}`), /VIDEO_WATCH_THRESHOLD_NOT_MET/);
+  const progress = await LessonProgressModel.findOne({ enrollmentId: enrollment.enrollment._id, lessonId: lesson._id });
+  assert.ok(progress);
+  progress.videoProgress = { watchedSeconds: 50, lastPositionSeconds: 50, lastHeartbeatAt: new Date(Date.now() - 40_000) };
+  await progress.save();
+  const credited = await recordVideoProgress(student.id, courseId, String(lesson._id), 60);
+  assert.equal(credited.watchedSeconds, 60);
+  await completeLesson(student.id, courseId, String(lesson._id), `req-${runId}`);
+  assert.equal(await AuditEventModel.countDocuments({ tenantId: org._id, action: "course.lesson.completed", resourceId: String(lesson._id) }), 1);
+
+  const uploadCourse = await createCourse(instructor.id, org.id, { ...courseInput, slug: `upload-grant-${counter}` }, `req-${runId}`); const uploadCourseId = String(uploadCourse.id); courseIds.push(new Types.ObjectId(uploadCourseId));
+  const uploadLesson = await createLesson(instructor.id, uploadCourseId, { title: "PDF", description: "", contentType: "document", resourceLinks: [], estimatedDurationMinutes: 0 }, `req-${runId}`);
+  const api = await startApi(); context.after(() => api.close());
+  const uploadPath = `/instructor/courses/${uploadCourseId}/lessons/${uploadLesson._id}/media-upload-grants`;
+  const body = { purpose: "document", fileName: "guide.pdf", contentType: "application/pdf", sizeBytes: 1000 };
+  assert.equal((await api.request(uploadPath, peerInstructor.id, { method: "POST", mfa: "fresh", body })).status, 404);
+  assert.equal((await api.request(uploadPath, student.id, { method: "POST", mfa: "fresh", body })).status, 404);
+  assert.equal((await api.request(uploadPath, instructor.id, { method: "POST", mfa: "fresh", body: { ...body, contentType: "text/html" } })).status, 400);
+  const unavailable = await api.request(uploadPath, instructor.id, { method: "POST", mfa: "fresh", body });
+  assert.equal(unavailable.status, 503);
+  assert.equal(unavailable.body?.error?.code, "MEDIA_STORAGE_UNAVAILABLE");
+});
+
+test("media lifecycle mock-provider integration verifies tenant binding, lesson attachment, transactions, delivery and deletion", async (context) => {
+  const provider = new IntegrationMediaProvider(); setPrivateAssetStorageProvider(provider); context.after(() => setPrivateAssetStorageProvider(new UnconfiguredPrivateAssetStorage()));
+  const owner = await user("Media Owner"); const instructor = await user("Media Instructor"); const peer = await user("Media Peer"); const student = await user("Media Student"); const outsider = await user("Media Outsider");
+  const org = await organization(owner._id, [{ userId: instructor._id, roles: ["INSTRUCTOR"] }, { userId: peer._id, roles: ["INSTRUCTOR"] }, { userId: student._id, roles: ["STUDENT"] }]);
+  const otherOrg = await organization(outsider._id);
+  const course = await createCourse(instructor.id, org.id, { ...courseInput, slug: `media-course-${counter}` }, `req-${runId}`); const courseId = String(course.id); courseIds.push(new Types.ObjectId(courseId));
+  const lesson = await createLesson(instructor.id, courseId, { title: "Private PDF", description: "", contentType: "document", resourceLinks: [], estimatedDurationMinutes: 0 }, `req-${runId}`);
+  const input = { lessonId: String(lesson._id), purpose: "document" as const, fileName: "guide.pdf", contentType: "application/pdf", sizeBytes: Buffer.byteLength("%PDF-1.7 test") };
+  await assert.rejects(createLessonMediaUploadGrant(peer.id, courseId, input, `req-${runId}`), /NOT_FOUND/);
+  await assert.rejects(createLessonMediaUploadGrant(student.id, courseId, input, `req-${runId}`), /NOT_FOUND/);
+  await assert.rejects(createLessonMediaUploadGrant(outsider.id, courseId, input, `req-${runId}`), /NOT_FOUND/);
+  const grant = await createLessonMediaUploadGrant(instructor.id, courseId, input, `req-${runId}`);
+  assert.equal(grant.intentId.length, 24);
+  assert.doesNotMatch(JSON.stringify(grant), /api_secret|api_key|cloud_name/);
+  const intent = await MediaUploadIntentModel.findById(grant.intentId).lean(); assert.equal(intent?.tenantId.toString(), org.id);
+  provider.reuseAssetId = true;
+  const bytes = Buffer.from("%PDF-1.7 test");
+  const uploaded = await uploadAndVerifyLessonMedia(instructor.id, courseId, String(lesson._id), grant.intentId, Readable.from([bytes]), bytes.length, "application/pdf", `req-${runId}`);
+  const asset = await MediaAssetModel.findById(uploaded.asset.id).lean();
+  assert.equal(asset?.tenantId.toString(), org.id); assert.equal(asset?.courseId.toString(), courseId); assert.equal(asset?.lessonId.toString(), String(lesson._id));
+  assert.equal(asset?.state, "ready"); assert.equal((await LessonModel.findById(lesson._id).lean())?.contentData?.assetId, uploaded.asset.id);
+  assert.equal(await AuditEventModel.countDocuments({ tenantId: org.id, action: "course.media.verified", resourceId: uploaded.asset.id }), 1);
+
+  const secondLesson = await createLesson(instructor.id, courseId, { title: "Rollback PDF", description: "", contentType: "document", resourceLinks: [], estimatedDurationMinutes: 0 }, `req-${runId}`);
+  const secondInput = { ...input, lessonId: String(secondLesson._id), fileName: "rollback.pdf" };
+  const secondGrant = await createLessonMediaUploadGrant(instructor.id, courseId, secondInput, `req-${runId}`);
+  await assert.rejects(uploadAndVerifyLessonMedia(instructor.id, courseId, String(secondLesson._id), secondGrant.intentId, Readable.from([bytes]), bytes.length, "application/pdf", `req-${runId}`));
+  assert.equal((await LessonModel.findById(secondLesson._id).lean())?.contentData, undefined);
+  assert.equal(await MediaAssetModel.countDocuments({ tenantId: org.id, courseId: new Types.ObjectId(courseId) }), 1);
+  assert.equal((await MediaUploadIntentModel.findById(secondGrant.intentId).lean())?.state, "failed");
+  assert.equal(provider.deletions.length, 1);
+  await deleteLesson(instructor.id, courseId, String(secondLesson._id), `req-${runId}`);
+
+  await publishCourse(instructor.id, courseId, `req-${runId}`);
+  await assert.rejects(createStudentMediaAccess(student.id, courseId, String(lesson._id), uploaded.asset.id), /ENROLLMENT_REQUIRED/);
+  await enrollInCourse(student.id, courseId, `req-${runId}`);
+  const delivery = await createStudentMediaAccess(student.id, courseId, String(lesson._id), uploaded.asset.id, "inline");
+  assert.match(delivery.url, /raw\/inline/); assert.ok(Date.parse(delivery.expiresAt) > Date.now());
+  await OrganizationMembershipModel.updateOne({ tenantId: org.id, userId: student._id }, { $set: { status: "suspended" } });
+  await assert.rejects(createStudentMediaAccess(student.id, courseId, String(lesson._id), uploaded.asset.id));
+
+  const deleteCourse = await createCourse(instructor.id, org.id, { ...courseInput, slug: `media-delete-${counter}` }, `req-${runId}`); const deleteCourseId = String(deleteCourse.id); courseIds.push(new Types.ObjectId(deleteCourseId));
+  const lessonToDelete = await createLesson(instructor.id, deleteCourseId, { title: "Delete PDF", description: "", contentType: "document", resourceLinks: [], estimatedDurationMinutes: 0 }, `req-${runId}`);
+  provider.reuseAssetId = false;
+  const deleteGrant = await createLessonMediaUploadGrant(instructor.id, deleteCourseId, { ...input, lessonId: String(lessonToDelete._id) }, `req-${runId}`);
+  const deleteUpload = await uploadAndVerifyLessonMedia(instructor.id, deleteCourseId, String(lessonToDelete._id), deleteGrant.intentId, Readable.from([bytes]), bytes.length, "application/pdf", `req-${runId}`);
+  await deleteLessonMediaAsset(instructor.id, deleteCourseId, String(lessonToDelete._id), deleteUpload.asset.id, `req-${runId}`);
+  assert.equal((await MediaAssetModel.findById(deleteUpload.asset.id).lean())?.state, "deleted");
+  assert.equal(await AuditEventModel.countDocuments({ tenantId: org.id, action: "course.media.deleted", resourceId: deleteUpload.asset.id }), 1);
+  assert.equal(await MediaAssetModel.countDocuments({ tenantId: otherOrg.id }), 0);
 });
 
 test("course routes enforce MFA and prevent another instructor or organization accessing the owner's course", async (context) => {

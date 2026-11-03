@@ -2,6 +2,12 @@ import { Schema, model } from "mongoose";
 
 export const COURSE_DIFFICULTIES = ["beginner", "intermediate", "advanced"] as const;
 export const COURSE_STATUSES = ["draft", "published", "archived"] as const;
+const sectionSchema = new Schema({
+  title: { type: String, required: true, trim: true, minlength: 1, maxlength: 160 },
+  description: { type: String, trim: true, maxlength: 1000, default: "" },
+  position: { type: Number, min: 0, max: 99, required: true },
+  status: { type: String, enum: ["draft", "published"], default: "draft", required: true },
+}, { timestamps: true });
 const courseSchema = new Schema({
   ownerScope: { type: String, enum: ["organization", "platform"], required: true, immutable: true },
   tenantId: { type: Schema.Types.ObjectId, ref: "Organization", required: function (this: { ownerScope: string }) { return this.ownerScope === "organization"; }, immutable: true },
@@ -20,6 +26,7 @@ const courseSchema = new Schema({
   status: { type: String, enum: COURSE_STATUSES, required: true, default: "draft" },
   publishedAt: { type: Date },
   estimatedDurationMinutes: { type: Number, min: 0, max: 100000, required: true, default: 0 },
+  sections: { type: [sectionSchema], default: [] },
   tags: { type: [String], required: true, default: [] },
   mutationVersion: { type: Number, default: 0, select: false },
   enrollmentVersion: { type: Number, default: 0, select: false },

@@ -11,6 +11,7 @@ import { CourseModel } from "../models/course.model.js";
 import { LessonModel } from "../models/lesson.model.js";
 import { EnrollmentModel } from "../models/enrollment.model.js";
 import { LessonProgressModel } from "../models/lesson-progress.model.js";
+import { MediaAssetModel, MediaUploadIntentModel } from "../models/media-asset.model.js";
 import type { AppConfig } from "./env.js";
 
 type IndexSpec = Readonly<{ collection: string; key: Readonly<Record<string, 1 | -1>>; unique?: boolean; expireAfterSeconds?: number; partialFilterExpression?: Readonly<Record<string, unknown>> }>;
@@ -42,6 +43,13 @@ export const REQUIRED_INDEXES: readonly IndexSpec[] = [
   { collection: "enrollments", key: { tenantId: 1, courseId: 1, status: 1 } },
   { collection: "lessonprogresses", key: { enrollmentId: 1, lessonId: 1 }, unique: true },
   { collection: "lessonprogresses", key: { tenantId: 1, courseId: 1, studentId: 1 } },
+  { collection: "mediaassets", key: { providerAssetId: 1 }, unique: true },
+  { collection: "mediaassets", key: { publicId: 1 }, unique: true },
+  { collection: "mediaassets", key: { intentId: 1 }, unique: true },
+  { collection: "mediaassets", key: { tenantId: 1, courseId: 1, lessonId: 1, state: 1 } },
+  { collection: "mediauploadintents", key: { publicId: 1 }, unique: true },
+  { collection: "mediauploadintents", key: { uploaderId: 1, state: 1, expiresAt: 1 } },
+  { collection: "mediauploadintents", key: { expiresAt: 1 } },
 ];
 
 export function isTransactionCapableHello(hello: Readonly<Record<string, unknown>>): boolean {
@@ -80,7 +88,7 @@ async function hasRequiredMongoIndexes(): Promise<boolean> {
 
 async function createRequiredIndexes(): Promise<void> {
   // Create only declared indexes. Never call syncIndexes(), which can drop existing indexes.
-  await Promise.all([UserModel.createIndexes(), UserCredentialModel.createIndexes(), AuthSessionModel.createIndexes(), PlatformGrantModel.createIndexes(), OrganizationModel.createIndexes(), OrganizationMembershipModel.createIndexes(), OrganizationInvitationModel.createIndexes(), AuditEventModel.createIndexes(), CourseModel.createIndexes(), LessonModel.createIndexes(), EnrollmentModel.createIndexes(), LessonProgressModel.createIndexes()]);
+  await Promise.all([UserModel.createIndexes(), UserCredentialModel.createIndexes(), AuthSessionModel.createIndexes(), PlatformGrantModel.createIndexes(), OrganizationModel.createIndexes(), OrganizationMembershipModel.createIndexes(), OrganizationInvitationModel.createIndexes(), AuditEventModel.createIndexes(), CourseModel.createIndexes(), LessonModel.createIndexes(), EnrollmentModel.createIndexes(), LessonProgressModel.createIndexes(), MediaAssetModel.createIndexes(), MediaUploadIntentModel.createIndexes()]);
   if (!await hasRequiredMongoIndexes()) throw new Error("Required MongoDB indexes are unavailable.");
 }
 
